@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+
+# Environment
+.env
+.venv/
+venv/
+
+# Data files (too large for git)
+data/cache/
+data/processed/segments/
+*.mp3
+*.wav
+*.flac
+
+# Keep test reference files
+!data/test/udhr_sample/reference.txt
+!data/test/udhr_sample/metadata.json
+!data/test/udhr_sample/README.txt
+
+# Models (too large for git)
+models/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Pytest
+.pytest_cache/
+
+# Results
+*.json
+!requirements.txt
+!data/test/udhr_sample/metadata.json

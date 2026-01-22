@@ -48,12 +48,18 @@ def download_dataset(num_samples: int = None, cache_dir: str = None, streaming: 
     if streaming or num_samples:
         # Use streaming mode to avoid rate limits and download only what we need
         print(f"Using streaming mode to fetch {num_samples or 'all'} samples...")
+
+        # Load without audio decoding (we'll handle it ourselves)
+        from datasets import Audio
         dataset = load_dataset(
             "Ken-Z/Latin-Audio",
             split="train",
             streaming=True,
             cache_dir=cache_dir
         )
+
+        # Cast audio to decode with soundfile instead of torchcodec
+        dataset = dataset.cast_column("audio", Audio(sampling_rate=16000, decode=True))
 
         # Collect samples
         samples = []

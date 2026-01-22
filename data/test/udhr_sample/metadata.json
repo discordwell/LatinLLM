@@ -1,0 +1,12 @@
+{
+  "title": "UDHR Article 1 in Latin",
+  "text_source": "Universal Declaration of Human Rights, Article 1 (Latin translation)",
+  "audio_source": "Internet Archive - Latin I class audio (placeholder)",
+  "audio_url": "https://archive.org/download/LatinMp3_242/latinaudacity.mp3",
+  "orthography": "classical",
+  "language": "Latin",
+  "iso_code": "lat",
+  "duration_seconds": 168.4,
+  "license": "Public Domain",
+  "notes": "Audio is classroom Latin, not matched transcript. Reference text is UDHR Article 1 for testing orthography normalization."
+}

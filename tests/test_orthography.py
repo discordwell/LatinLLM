@@ -122,7 +122,7 @@ class TestCountMacrons:
 
     def test_count_multiple(self):
         """Should count all macron characters."""
-        assert count_macrons("canō Trōiae") == 3
+        assert count_macrons("canō Trōiae") == 2  # ō in canō, ō in Trōiae
 
     def test_aeneid(self, aeneid_classical):
         """Should count macrons in longer text."""
