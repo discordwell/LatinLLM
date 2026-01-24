@@ -36,51 +36,72 @@ def download_dataset(num_samples: int = None, cache_dir: str = None, streaming: 
         streaming: Use streaming mode (avoids rate limits)
 
     Returns:
-        HuggingFace dataset object or list of samples
+        List of sample dictionaries with audio data
     """
-    from datasets import load_dataset
+    from huggingface_hub import hf_hub_download
+    import pandas as pd
+    import soundfile as sf
 
     print("Downloading Ken-Z/Latin-Audio dataset from Hugging Face...")
+    print("  (Using direct download method for compatibility)")
 
     if cache_dir is None:
         cache_dir = str(DATA_DIR / "cache")
 
-    if streaming or num_samples:
-        # Use streaming mode to avoid rate limits and download only what we need
-        print(f"Using streaming mode to fetch {num_samples or 'all'} samples...")
+    # Download metadata.csv
+    print("  Fetching metadata.csv...")
+    metadata_path = hf_hub_download(
+        repo_id="Ken-Z/Latin-Audio",
+        filename="metadata.csv",
+        repo_type="dataset",
+        cache_dir=cache_dir
+    )
 
-        # Load without audio decoding (we'll handle it ourselves)
-        from datasets import Audio
-        dataset = load_dataset(
-            "Ken-Z/Latin-Audio",
-            split="train",
-            streaming=True,
-            cache_dir=cache_dir
-        )
+    df = pd.read_csv(metadata_path)
+    total_available = len(df)
+    print(f"  Found {total_available} samples in metadata")
 
-        # Cast audio to decode with soundfile instead of torchcodec
-        dataset = dataset.cast_column("audio", Audio(sampling_rate=16000, decode=True))
+    # Limit samples if requested
+    if num_samples:
+        df = df.head(num_samples)
+        print(f"  Using first {num_samples} samples")
 
-        # Collect samples
-        samples = []
-        for i, item in enumerate(dataset):
-            if num_samples and i >= num_samples:
-                break
-            samples.append(item)
-            if (i + 1) % 50 == 0:
-                print(f"  Fetched {i + 1} samples...")
+    # Download and load audio files
+    samples = []
+    for i, row in df.iterrows():
+        file_name = row["file_name"]
+        transcription = row["transcription"]
 
-        print(f"Loaded {len(samples)} samples")
-        return samples
-    else:
-        print("This may take a while for the first download (~5GB)...")
-        dataset = load_dataset(
-            "Ken-Z/Latin-Audio",
-            split="train",
-            cache_dir=cache_dir
-        )
-        print(f"Loaded {len(dataset)} samples")
-        return dataset
+        try:
+            # Download audio file
+            audio_path = hf_hub_download(
+                repo_id="Ken-Z/Latin-Audio",
+                filename=file_name,
+                repo_type="dataset",
+                cache_dir=cache_dir
+            )
+
+            # Load audio
+            waveform, sample_rate = sf.read(audio_path, dtype="float32")
+
+            samples.append({
+                "audio": {
+                    "array": waveform,
+                    "sampling_rate": sample_rate,
+                    "path": audio_path
+                },
+                "transcription": transcription
+            })
+
+            if (len(samples)) % 50 == 0:
+                print(f"  Fetched {len(samples)} samples...")
+
+        except Exception as e:
+            print(f"  Warning: Failed to load {file_name}: {e}")
+            continue
+
+    print(f"Loaded {len(samples)} samples")
+    return samples
 
 
 def prepare_samples(
@@ -165,10 +186,23 @@ def prepare_samples(
     return samples
 
 
+def deduplicate_samples(samples: List[Dict], key: str = "sentence") -> List[Dict]:
+    """Remove duplicate samples based on normalized text."""
+    seen = set()
+    unique = []
+    for sample in samples:
+        text = sample[key].strip().lower()
+        if text not in seen:
+            seen.add(text)
+            unique.append(sample)
+    print(f"  Removed {len(samples) - len(unique)} duplicates")
+    return unique
+
+
 def split_data(
     samples: List[Dict],
-    train_ratio: float = 0.9,
-    val_ratio: float = 0.05,
+    train_ratio: float = 0.8,
+    val_ratio: float = 0.1,
     seed: int = 42
 ) -> Tuple[List[Dict], List[Dict], List[Dict]]:
     """Split samples into train/val/test sets."""
@@ -264,8 +298,12 @@ def main():
         print("No samples prepared!")
         return
 
+    # Deduplicate samples
+    print(f"\nDeduplicating samples...")
+    samples = deduplicate_samples(samples)
+
     # Split data
-    print(f"\nSplitting data (90/5/5)...")
+    print(f"\nSplitting data (80/10/10)...")
     train, val, test = split_data(samples, seed=args.seed)
     print(f"  Train: {len(train)}")
     print(f"  Validation: {len(val)}")

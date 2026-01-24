@@ -96,8 +96,10 @@ def transcribe_mms_baseline(audio_path: str, sample_rate: int = 16000) -> str:
     processor = transcribe_mms_baseline.processor
     device = transcribe_mms_baseline.device
 
-    # Load audio
-    waveform, sr = torchaudio.load(audio_path)
+    # Load audio using soundfile backend (avoids TorchCodec dependency)
+    import soundfile as sf
+    waveform_np, sr = sf.read(audio_path, dtype="float32")
+    waveform = torch.tensor(waveform_np).unsqueeze(0)  # Add channel dim
 
     if sr != 16000:
         resampler = torchaudio.transforms.Resample(sr, 16000)
@@ -141,8 +143,10 @@ def transcribe_finetuned(audio_path: str, model_path: str) -> str:
 
     model, processor, device = getattr(transcribe_finetuned, cache_key)
 
-    # Load and process audio
-    waveform, sr = torchaudio.load(audio_path)
+    # Load and process audio using soundfile backend
+    import soundfile as sf
+    waveform_np, sr = sf.read(audio_path, dtype="float32")
+    waveform = torch.tensor(waveform_np).unsqueeze(0)  # Add channel dim
 
     if sr != 16000:
         resampler = torchaudio.transforms.Resample(sr, 16000)

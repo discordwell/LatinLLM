@@ -41,17 +41,18 @@ class TrainingConfig:
     target_language: str = "lat"  # Latin (custom)
 
     # Training
-    num_epochs: int = 10
-    batch_size: int = 8
-    gradient_accumulation_steps: int = 4
-    learning_rate: float = 1e-3
-    warmup_steps: int = 100
+    num_epochs: int = 5
+    batch_size: int = 2  # Smaller batch for MPS memory
+    gradient_accumulation_steps: int = 16  # Effective batch = 32
+    learning_rate: float = 1e-3  # Higher LR for adapter-only training
+    warmup_ratio: float = 0.1  # 10% of training for warmup
     weight_decay: float = 0.01
+    max_grad_norm: float = 1.0  # Gradient clipping to prevent explosion
 
     # Memory optimization
     fp16: bool = True
     gradient_checkpointing: bool = True
-    max_audio_length: float = 30.0  # seconds
+    max_audio_length: float = 10.0  # seconds (shorter for stability)
 
     # Output
     output_dir: str = str(MODELS_DIR / "mms-latin")
@@ -94,19 +95,20 @@ class LatinASRDataset(Dataset):
     def __getitem__(self, idx):
         item = self.data[idx]
 
-        # Load audio
+        # Load audio using soundfile (avoids TorchCodec dependency)
+        import soundfile as sf
         audio_path = item["audio"]
-        waveform, sr = torchaudio.load(audio_path)
+        waveform, sr = sf.read(audio_path, dtype="float32")
 
         # Resample if needed
         if sr != self.sample_rate:
+            waveform_tensor = torch.tensor(waveform).unsqueeze(0)
             resampler = torchaudio.transforms.Resample(sr, self.sample_rate)
-            waveform = resampler(waveform)
+            waveform = resampler(waveform_tensor).squeeze().numpy()
 
-        # Convert to mono and numpy
-        if waveform.shape[0] > 1:
-            waveform = waveform.mean(dim=0, keepdim=True)
-        waveform = waveform.squeeze().numpy()
+        # Convert to mono if stereo
+        if len(waveform.shape) > 1 and waveform.shape[1] == 2:
+            waveform = waveform.mean(axis=1)
 
         # Truncate if too long
         max_samples = int(self.max_audio_length * self.sample_rate)
@@ -117,34 +119,62 @@ class LatinASRDataset(Dataset):
         text = item["sentence"]
 
         return {
-            "audio": waveform,
+            "input_values": waveform,  # Key required by Trainer's LengthGroupedSampler
             "text": text
         }
 
 
+_DEBUG_BATCH_COUNT = [0]
+
 def collate_fn(batch, processor):
     """Collate function for DataLoader."""
     # Process audio
-    audio_arrays = [item["audio"] for item in batch]
+    audio_arrays = [item["input_values"] for item in batch]
     texts = [item["text"] for item in batch]
 
-    # Process inputs
+    # Check for NaN/Inf in input audio
+    for i, arr in enumerate(audio_arrays):
+        if np.isnan(arr).any() or np.isinf(arr).any():
+            print(f"Warning: NaN/Inf in audio sample {i}, replacing with zeros")
+            audio_arrays[i] = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Process inputs without attention mask (workaround for MPS boolean indexing issue)
     inputs = processor(
         audio_arrays,
         sampling_rate=16000,
         return_tensors="pt",
+        padding=True,
+        return_attention_mask=False
+    )
+
+    # Ensure float32 dtype
+    inputs["input_values"] = inputs["input_values"].float()
+
+    # Process labels (text to token IDs) using tokenizer directly
+    labels = processor.tokenizer(
+        texts,
+        return_tensors="pt",
         padding=True
     )
 
-    # Process labels (text to token IDs)
-    with processor.as_target_processor():
-        labels = processor(
-            texts,
-            return_tensors="pt",
-            padding=True
-        )
-
     inputs["labels"] = labels.input_ids
+
+    # Debug: print label info for first few batches
+    _DEBUG_BATCH_COUNT[0] += 1
+    vocab_size = len(processor.tokenizer)
+
+    # Always clamp labels to valid range (safety measure for MPS compatibility)
+    # Use vocab_size - 1 as max to ensure labels < vocab_size
+    inputs['labels'] = inputs['labels'].clamp(min=0, max=vocab_size-1)
+
+    if _DEBUG_BATCH_COUNT[0] <= 3:
+        print(f"\n[DEBUG batch {_DEBUG_BATCH_COUNT[0]}]")
+        print(f"  Input shape: {inputs['input_values'].shape}")
+        print(f"  Labels shape: {inputs['labels'].shape}")
+        print(f"  Labels min/max: {inputs['labels'].min().item()}/{inputs['labels'].max().item()}")
+        print(f"  Vocab size: {vocab_size}")
+        print(f"  Sample text: {texts[0][:50]}")
+        print(f"  Sample labels: {inputs['labels'][0][:20].tolist()}")
 
     # Replace padding with -100 for loss computation
     inputs["labels"] = inputs["labels"].masked_fill(
@@ -187,11 +217,16 @@ def setup_model_and_processor(config: TrainingConfig):
     print(f"Loading MMS model: {config.model_id}")
     print(f"Source adapter: {config.source_language}")
 
-    # Load model with Italian adapter
+    # Load model with Italian adapter (fp16 only on CUDA)
+    use_fp16 = config.fp16 and torch.cuda.is_available()
     model = Wav2Vec2ForCTC.from_pretrained(
         config.model_id,
-        torch_dtype=torch.float16 if config.fp16 else torch.float32
+        torch_dtype=torch.float16 if use_fp16 else torch.float32
     )
+
+    # Enable SpecAugment for regularization on small dataset
+    model.config.mask_time_prob = 0.05
+    model.config.mask_feature_prob = 0.05
 
     # Load Italian adapter as starting point
     model.load_adapter(config.source_language)
@@ -227,12 +262,18 @@ def setup_model_and_processor(config: TrainingConfig):
         tokenizer=tokenizer
     )
 
+    # Update model config for new vocabulary size
+    model.config.vocab_size = len(vocab)
+
     # Reinitialize output layer for new vocabulary
     model.lm_head = torch.nn.Linear(
         model.config.hidden_size,
         len(vocab),
         bias=True
     )
+    # Initialize with standard gain (0.1 was too small, causing vanishing gradients)
+    torch.nn.init.xavier_uniform_(model.lm_head.weight, gain=1.0)
+    torch.nn.init.zeros_(model.lm_head.bias)
 
     # Freeze base model, only train adapter and new head
     model.freeze_base_model()
@@ -293,10 +334,11 @@ def train(config: TrainingConfig):
     # Setup model
     model, processor, vocab = setup_model_and_processor(config)
 
-    # Move to device
+    # Move to device (ensure float32 for MPS)
     if device == "cuda":
         model = model.cuda()
     elif device == "mps":
+        model = model.float()  # Ensure float32 before moving to MPS
         model = model.to("mps")
 
     # Create datasets
@@ -316,7 +358,8 @@ def train(config: TrainingConfig):
     # Training arguments
     training_args = TrainingArguments(
         output_dir=config.output_dir,
-        group_by_length=True,
+        group_by_length=False,  # Disabled - custom dataset format
+        remove_unused_columns=False,  # Keep 'text' column for our collate_fn
         per_device_train_batch_size=config.batch_size,
         per_device_eval_batch_size=config.batch_size,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
@@ -327,7 +370,8 @@ def train(config: TrainingConfig):
         logging_steps=config.logging_steps,
         learning_rate=config.learning_rate,
         weight_decay=config.weight_decay,
-        warmup_steps=config.warmup_steps,
+        warmup_ratio=config.warmup_ratio,
+        max_grad_norm=config.max_grad_norm,
         num_train_epochs=config.num_epochs,
         fp16=config.fp16 and device == "cuda",
         gradient_checkpointing=config.gradient_checkpointing,
